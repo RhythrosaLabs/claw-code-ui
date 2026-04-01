@@ -36,6 +36,12 @@ class UsageSummary:
             output_tokens=self.output_tokens + len(output.split()),
         )
 
+    def add_actual(self, input_tokens: int, output_tokens: int) -> 'UsageSummary':
+        return UsageSummary(
+            input_tokens=self.input_tokens + input_tokens,
+            output_tokens=self.output_tokens + output_tokens,
+        )
+
 
 @dataclass
 class PortingBacklog:

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from .commands import build_command_backlog
+from .llm_client import LLMClient, LLMConfig
 from .models import PermissionDenial, UsageSummary
 from .port_manifest import PortManifest, build_port_manifest
 from .session_store import StoredSession, load_session, save_session
@@ -41,6 +42,67 @@ class QueryEnginePort:
     permission_denials: list[PermissionDenial] = field(default_factory=list)
     total_usage: UsageSummary = field(default_factory=UsageSummary)
     transcript_store: TranscriptStore = field(default_factory=TranscriptStore)
+    llm_config: LLMConfig = field(default_factory=LLMConfig)
+    _llm_client: LLMClient | None = field(default=None, repr=False)
+    _llm_enabled: bool = field(default=False, repr=False)
+
+    @property
+    def llm_client(self) -> LLMClient | None:
+        if not self._llm_enabled:
+            return None
+        if self._llm_client is not None:
+            return self._llm_client
+        if self.llm_config.is_configured:
+            self._llm_client = LLMClient(config=self.llm_config)
+            return self._llm_client
+        return None
+
+    @property
+    def llm_active(self) -> bool:
+        return self.llm_client is not None
+
+    def set_llm_config(self, config: LLMConfig) -> None:
+        self.llm_config = config
+        self._llm_client = None  # reset so it picks up new config
+        self._llm_enabled = config.is_configured
+
+    def _build_system_prompt(self) -> str:
+        n_cmds = len(build_command_backlog().modules)
+        n_tools = len(build_tool_backlog().modules)
+        n_files = self.manifest.total_python_files
+        n_mods = len(self.manifest.top_level_modules)
+        return (
+            "You are Claw Code, an AI coding agent assistant. "
+            "You help users explore, understand, and work with their codebase.\n\n"
+            f"Workspace: {n_files} Python files across {n_mods} modules, "
+            f"{n_cmds} commands, {n_tools} tools.\n\n"
+            "Guidelines:\n"
+            "- Answer the user's question directly and concisely.\n"
+            "- When matched commands or tools are provided in context, explain what they do and how they relate to the question.\n"
+            "- Format responses in Markdown. Use code blocks for code.\n"
+            "- If you don't know something, say so rather than guessing.\n"
+            "- Be helpful and practical — focus on what the user can do next."
+        )
+
+    def _build_llm_messages(self, prompt: str, matched_commands: tuple[str, ...], matched_tools: tuple[str, ...]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        # Include recent conversation history with proper alternating roles
+        history = self.mutable_messages[-20:]  # last 20 entries
+        for entry in history:
+            role = entry.get("role", "user") if isinstance(entry, dict) else "user"
+            content = entry.get("content", entry) if isinstance(entry, dict) else entry
+            messages.append({"role": role, "content": content})
+        # Add routing context if available
+        context_parts = []
+        if matched_commands:
+            context_parts.append(f"Matched commands: {', '.join(matched_commands)}")
+        if matched_tools:
+            context_parts.append(f"Matched tools: {', '.join(matched_tools)}")
+        user_content = prompt
+        if context_parts:
+            user_content = f"[Context: {'; '.join(context_parts)}]\n\n{prompt}"
+        messages.append({"role": "user", "content": user_content})
+        return messages
 
     @classmethod
     def from_workspace(cls) -> 'QueryEnginePort':
@@ -77,6 +139,11 @@ class QueryEnginePort:
                 stop_reason='max_turns_reached',
             )
 
+        # ── Real LLM call if configured ─────────────────────────────
+        if self.llm_active:
+            return self._submit_with_llm(prompt, matched_commands, matched_tools, denied_tools)
+
+        # ── Shim fallback ───────────────────────────────────────────
         summary_lines = [
             f'Prompt: {prompt}',
             f'Matched commands: {", ".join(matched_commands) if matched_commands else "none"}',
@@ -103,6 +170,48 @@ class QueryEnginePort:
             stop_reason=stop_reason,
         )
 
+    def _submit_with_llm(
+        self,
+        prompt: str,
+        matched_commands: tuple[str, ...],
+        matched_tools: tuple[str, ...],
+        denied_tools: tuple[PermissionDenial, ...],
+    ) -> TurnResult:
+        client = self.llm_client
+        system = self._build_system_prompt()
+        messages = self._build_llm_messages(prompt, matched_commands, matched_tools)
+
+        # Update client system prompt
+        client.config = LLMConfig(
+            provider=self.llm_config.provider,
+            model=self.llm_config.model,
+            api_key=self.llm_config.api_key,
+            max_tokens=self.llm_config.max_tokens,
+            temperature=self.llm_config.temperature,
+            system_prompt=system,
+        )
+
+        response = client.complete(messages)
+        output = response.content
+        self.total_usage = self.total_usage.add_actual(response.input_tokens, response.output_tokens)
+        stop_reason = response.stop_reason
+
+        self.mutable_messages.append({"role": "user", "content": prompt})
+        self.mutable_messages.append({"role": "assistant", "content": output})
+        self.transcript_store.append(prompt)
+        self.permission_denials.extend(denied_tools)
+        self.compact_messages_if_needed()
+
+        return TurnResult(
+            prompt=prompt,
+            output=output,
+            matched_commands=matched_commands,
+            matched_tools=matched_tools,
+            permission_denials=denied_tools,
+            usage=self.total_usage,
+            stop_reason=stop_reason,
+        )
+
     def stream_submit_message(
         self,
         prompt: str,
@@ -117,6 +226,13 @@ class QueryEnginePort:
             yield {'type': 'tool_match', 'tools': matched_tools}
         if denied_tools:
             yield {'type': 'permission_denial', 'denials': [denial.tool_name for denial in denied_tools]}
+
+        # ── Real LLM streaming if configured ────────────────────────
+        if self.llm_active:
+            yield from self._stream_with_llm(prompt, matched_commands, matched_tools, denied_tools)
+            return
+
+        # ── Shim fallback ───────────────────────────────────────────
         result = self.submit_message(prompt, matched_commands, matched_tools, denied_tools)
         yield {'type': 'message_delta', 'text': result.output}
         yield {
@@ -125,6 +241,47 @@ class QueryEnginePort:
             'stop_reason': result.stop_reason,
             'transcript_size': len(self.transcript_store.entries),
         }
+
+    def _stream_with_llm(
+        self,
+        prompt: str,
+        matched_commands: tuple[str, ...],
+        matched_tools: tuple[str, ...],
+        denied_tools: tuple[PermissionDenial, ...],
+    ):
+        client = self.llm_client
+        system = self._build_system_prompt()
+        messages = self._build_llm_messages(prompt, matched_commands, matched_tools)
+
+        client.config = LLMConfig(
+            provider=self.llm_config.provider,
+            model=self.llm_config.model,
+            api_key=self.llm_config.api_key,
+            max_tokens=self.llm_config.max_tokens,
+            temperature=self.llm_config.temperature,
+            system_prompt=system,
+        )
+
+        full_output = ""
+        for event in client.stream(messages):
+            if event["type"] == "delta":
+                full_output += event["text"]
+                yield {'type': 'message_delta', 'text': event["text"]}
+            elif event["type"] == "done":
+                self.total_usage = self.total_usage.add_actual(
+                    event["input_tokens"], event["output_tokens"]
+                )
+                self.mutable_messages.append({"role": "user", "content": prompt})
+                self.mutable_messages.append({"role": "assistant", "content": full_output})
+                self.transcript_store.append(prompt)
+                self.permission_denials.extend(denied_tools)
+                self.compact_messages_if_needed()
+                yield {
+                    'type': 'message_stop',
+                    'usage': {'input_tokens': self.total_usage.input_tokens, 'output_tokens': self.total_usage.output_tokens},
+                    'stop_reason': event.get("stop_reason", "end_turn"),
+                    'transcript_size': len(self.transcript_store.entries),
+                }
 
     def compact_messages_if_needed(self) -> None:
         if len(self.mutable_messages) > self.config.compact_after_turns:
