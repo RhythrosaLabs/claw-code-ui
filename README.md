@@ -145,3 +145,8 @@ This fork is based on [instructkr/claw-code](https://github.com/instructkr/claw-
 
 - This repository does **not** claim ownership of the original Claw Code source material.
 - This repository is **not affiliated with, endorsed by, or maintained by the original authors**.
+
+
+## Support
+
+If you find this useful, consider supporting via [PayPal](https://paypal.me/noodlebake)
